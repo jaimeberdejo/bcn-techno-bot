@@ -14,31 +14,29 @@ from telegram.ext import (
     ContextTypes
 )
 
-# Importamos las funciones, incluida la nueva de búsqueda por fecha
+# Importamos las funciones necesarias de la base de datos
 from database import (
     get_upcoming_events, 
     search_events, 
-    search_events_by_date, # <-- NUEVA
+    search_events_by_date,
     add_user_if_not_exists
 )
 
 # --- CONFIGURACIÓN ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-BOT_TOKEN = "8204992864:AAGDjAaZ7TNDt8C50YAmgExH0qDrW_zaKw8" 
+BOT_TOKEN = "8204992864:AAGDjAaZ7TNDt8C50YAmgExH0qDrW_zaKw8"
 EVENTS_PER_PAGE = 5
 
-# --- ESTADOS PARA LA CONVERSACIÓN ---
-CHOOSING_SEARCH, TYPING_SEARCH, CHOOSING_DATE_RANGE = range(3)
+# --- ESTADOS PARA LAS CONVERSACIONES ---
+CHOOSING_SEARCH, TYPING_SEARCH, CHOOSING_DATE_RANGE, TYPING_CUSTOM_DATE = range(4)
 
 # --- FUNCIONES AUXILIARES ---
 def escape_markdown_v2(text: str) -> str:
-    # (sin cambios en esta función)
     if not isinstance(text, str): text = str(text)
     escape_chars = r'_*[]()~`>#+-.=|{}!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 async def format_events_message(events, total_events, offset, search_info=None):
-    # (sin cambios en esta función)
     if not events:
         if search_info: return f"No encontré eventos para '{escape_markdown_v2(search_info['query_display'])}'\\.", None
         return "No hay más eventos próximos en la base de datos\\.", None
@@ -68,11 +66,12 @@ async def format_events_message(events, total_events, offset, search_info=None):
 
 # --- COMANDOS Y HANDLERS BÁSICOS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mensaje de bienvenida al usar /start."""
     welcome_message = (
         "¡Bienvenido a BCN Techno Radar\\! 🚀\n\n"
         "Usa los siguientes comandos para empezar:\n"
         "/proximas \\- Ver las próximas fiestas\\.\n"
-        "/buscar \\- Busca por artista o club \\.\n"
+        "/buscar \\- Busca por artista o club \\(próximamente\\)\\.\n"
         "/alertas \\- Configura tus notificaciones \\(próximamente\\)\\.\n"
         "/help \\- Muestra esta ayuda de nuevo\\."
     )
@@ -81,20 +80,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra la lista de comandos."""
     await start(update, context)
-
+    
 async def proximas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     events, total_events = get_upcoming_events(limit=EVENTS_PER_PAGE, offset=0)
     message, reply_markup = await format_events_message(events, total_events, 0)
     await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 
-# --- CONVERSACIÓN DE BÚSQUEDA (ACTUALIZADA) ---
+# --- CONVERSACIÓN DE BÚSQUEDA (ACTUALIZADA CON FECHA CUSTOM) ---
 async def buscar_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
         [
             InlineKeyboardButton("👤 Artista", callback_data="search_by_artist"),
             InlineKeyboardButton("🏠 Club", callback_data="search_by_club"),
         ],
-        [InlineKeyboardButton("📅 Fecha", callback_data="search_by_date")] # <-- NUEVO BOTÓN
+        [InlineKeyboardButton("📅 Fecha", callback_data="search_by_date")]
     ]
     await update.message.reply_text("Perfecto. ¿Qué quieres buscar? Elige una opción:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSING_SEARCH
@@ -118,7 +117,7 @@ async def received_search_query(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 async def ask_for_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """NUEVA FUNCIÓN: Muestra los botones de rangos de fecha."""
+    """Muestra los botones de rangos de fecha."""
     query = update.callback_query
     await query.answer()
     keyboard = [
@@ -126,47 +125,62 @@ async def ask_for_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
             InlineKeyboardButton("Hoy", callback_data="date_range_today"),
             InlineKeyboardButton("Mañana", callback_data="date_range_tomorrow"),
         ],
-        [InlineKeyboardButton("Este fin de semana", callback_data="date_range_weekend")]
+        [InlineKeyboardButton("Este fin de semana", callback_data="date_range_weekend")],
+        [InlineKeyboardButton("✍️ Fecha Específica", callback_data="date_range_custom")] # <-- NUEVO BOTÓN
     ]
     await query.edit_message_text("Elige un rango de fechas:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CHOOSING_DATE_RANGE
 
 async def received_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """NUEVA FUNCIÓN: Procesa la elección del rango de fecha y busca en la BD."""
+    """Procesa la elección de un rango de fecha PREDEFINIDO."""
     query = update.callback_query
     await query.answer()
-    
     choice = query.data.split('_')[-1]
     today = datetime.now()
-    
     if choice == "today":
-        start_date = today
-        end_date = today
-        query_display = "Hoy"
+        start_date, end_date, query_display = today, today, "Hoy"
     elif choice == "tomorrow":
-        start_date = today + timedelta(days=1)
-        end_date = start_date
+        start_date = end_date = today + timedelta(days=1)
         query_display = "Mañana"
     elif choice == "weekend":
-        # Viernes es el día 4 (lunes=0). Sumamos los días que faltan para el viernes.
         days_until_friday = (4 - today.weekday() + 7) % 7
         start_date = today + timedelta(days=days_until_friday)
-        end_date = start_date + timedelta(days=2) # Viernes, Sábado, Domingo
+        end_date = start_date + timedelta(days=2)
         query_display = "Este fin de semana"
-    else:
-        return ConversationHandler.END
-
+    else: return ConversationHandler.END
     start_date_str = start_date.strftime('%Y-%m-%d')
     end_date_str = end_date.strftime('%Y-%m-%d')
-
     events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=0)
-    
-    # Preparamos la info para el formateador de mensajes y la paginación
     search_info = {'type': 'date', 'query': f"{start_date_str}_{end_date_str}", 'query_display': query_display}
     message, markup = await format_events_message(events, total, 0, search_info)
-    
     await query.edit_message_text(text=message, reply_markup=markup, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
     return ConversationHandler.END
+
+async def ask_for_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """NUEVA FUNCIÓN: Pide al usuario que escriba una fecha."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Ok, dime la fecha que buscas en formato `AAAA-MM-DD`\nPor ejemplo: `2025-09-27`", parse_mode=ParseMode.MARKDOWN_V2)
+    return TYPING_CUSTOM_DATE
+
+async def received_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """NUEVA FUNCIÓN: Valida y procesa la fecha escrita por el usuario."""
+    date_text = update.message.text
+    try:
+        # Validamos que el formato de la fecha sea correcto
+        datetime.strptime(date_text, '%Y-%m-%d')
+        start_date_str = end_date_str = date_text
+        
+        events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=0)
+        search_info = {'type': 'date', 'query': f"{start_date_str}_{end_date_str}", 'query_display': start_date_str}
+        message, markup = await format_events_message(events, total, 0, search_info)
+        
+        await update.message.reply_text(message, reply_markup=markup, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+        return ConversationHandler.END
+    except ValueError:
+        # Si el formato es incorrecto, pedimos que lo intente de nuevo
+        await update.message.reply_text("Formato de fecha incorrecto\\. Por favor, usa `AAAA-MM-DD`\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        return TYPING_CUSTOM_DATE # Mantenemos al usuario en el mismo estado para que pueda reintentar
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Búsqueda cancelada.")
@@ -178,23 +192,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    
     message, reply_markup = "", None
-
     if data.startswith("page_"):
         offset = int(data.split("_")[1])
         events, total_events = get_upcoming_events(limit=EVENTS_PER_PAGE, offset=offset)
         message, reply_markup = await format_events_message(events, total_events, offset)
-    
     elif data.startswith("search_"):
         parts = data.split('_')
         search_type = parts[1]
-        
         if search_type == "date":
-            # Paginación de búsqueda por fecha: search_date_YYYY-MM-DD_YYYY-MM-DD_offset
             start_date_str, end_date_str, offset = parts[2], parts[3], int(parts[4])
             events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=offset)
-            query_display = f"del {start_date_str} al {end_date_str}"
+            query_display = f"del {start_date_str} al {end_date_str}" if start_date_str != end_date_str else start_date_str
             search_info = {'type': 'date', 'query': f"{start_date_str}_{end_date_str}", 'query_display': query_display}
             message, reply_markup = await format_events_message(events, total, offset, search_info)
         else: # artist o club
@@ -203,7 +212,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             events, total = search_events(query=query_text, search_by=search_by_db, limit=EVENTS_PER_PAGE, offset=offset)
             search_info = {'type': search_type, 'query': query_text, 'query_display': query_text}
             message, reply_markup = await format_events_message(events, total, offset, search_info)
-
     if message:
         await query.edit_message_text(text=message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 
@@ -217,13 +225,17 @@ def main():
         states={
             CHOOSING_SEARCH: [
                 CallbackQueryHandler(ask_for_search_term, pattern="^search_by_(artist|club)$"),
-                CallbackQueryHandler(ask_for_date_range, pattern="^search_by_date$"), # <-- NUEVA RUTA
+                CallbackQueryHandler(ask_for_date_range, pattern="^search_by_date$"),
             ],
             TYPING_SEARCH: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, received_search_query),
             ],
             CHOOSING_DATE_RANGE: [
-                CallbackQueryHandler(received_date_range, pattern="^date_range_") # <-- NUEVO ESTADO
+                CallbackQueryHandler(received_date_range, pattern="^date_range_(today|tomorrow|weekend)$"),
+                CallbackQueryHandler(ask_for_custom_date, pattern="^date_range_custom$"), # <-- NUEVA RUTA
+            ],
+            TYPING_CUSTOM_DATE: [ # <-- NUEVO ESTADO
+                MessageHandler(filters.TEXT & ~filters.COMMAND, received_custom_date)
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
