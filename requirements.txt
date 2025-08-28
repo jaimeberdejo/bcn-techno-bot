@@ -1,6 +1,9 @@
 python-telegram-bot==22.3
-requests==2.32.3
-beautifulsoup4==4.12.3
-schedule==1.2.2
-certifi==2024.7.4
-watchdog==4.0.1
+python-telegram-bot[job-queue]==22.3
+requests
+beautifulsoup4
+schedule
+certifi
+watchdog
+selenium
+webdriver-manager
