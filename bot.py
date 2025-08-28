@@ -43,6 +43,8 @@ from database import (
     get_user_alerts,
     delete_alert,
     find_users_for_new_event,
+    get_unnotified_events,
+    mark_event_as_notified,
 )
 
 # --- CONFIGURACIÓN Y CONSTANTES ---
@@ -166,7 +168,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Maneja el comando /start. Da la bienvenida al usuario y lo registra en la BD.
     """
     add_user_if_not_exists(update.message.chat_id)
-    # CORRECCIÓN: Se escapa el carácter '!' para evitar el error BadRequest.
     welcome_message = (
         "¡Bienvenido a BCN Techno Radar\\! 🚀\n\n"
         "Usa los siguientes comandos para empezar:\n"
@@ -223,7 +224,10 @@ async def buscar_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             InlineKeyboardButton("👤 Artista", callback_data="search_by_artist"),
             InlineKeyboardButton("🏠 Club", callback_data="search_by_club")
         ],
-        [InlineKeyboardButton("📅 Fecha", callback_data="search_by_date")]
+        [
+            InlineKeyboardButton("🎉 Fiesta", callback_data="search_by_event_name"),
+            InlineKeyboardButton("📅 Fecha", callback_data="search_by_date")
+        ]
     ]
     await update.message.reply_text(
         "Perfecto. ¿Qué quieres buscar? Elige una opción:",
@@ -234,15 +238,22 @@ async def buscar_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def ask_for_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Pregunta al usuario el término de búsqueda (nombre de artista o club).
+    Pregunta al usuario el término de búsqueda (artista, club o nombre de fiesta).
     """
     query = update.callback_query
     await query.answer()
     
-    search_type = query.data.split('_')[-1]
+    search_type = query.data.split('_by_')[-1]
     context.user_data['search_type'] = search_type
     
-    await query.edit_message_text(text=f"Ok, dime el nombre del {search_type} que buscas:")
+    type_map = {
+        'artist': 'del artista',
+        'club': 'del club',
+        'event_name': 'de la fiesta'
+    }
+    display_type = type_map.get(search_type, 'elemento')
+    
+    await query.edit_message_text(text=f"Ok, dime el nombre {display_type} que buscas:")
     return TYPING_SEARCH
 
 
@@ -252,7 +263,13 @@ async def received_search_query(update: Update, context: ContextTypes.DEFAULT_TY
     """
     query_text = update.message.text
     search_type = context.user_data.get('search_type', 'artist')
-    search_by_db = 'artists' if search_type == 'artist' else 'club_name'
+    
+    column_map = {
+        'artist': 'artists',
+        'club': 'club_name',
+        'event_name': 'event_name'
+    }
+    search_by_db = column_map.get(search_type, 'artists')
     
     events, total = search_events(query=query_text, search_by=search_by_db, limit=EVENTS_PER_PAGE, offset=0)
     search_info = {'type': search_type, 'query': query_text, 'query_display': query_text}
@@ -312,7 +329,6 @@ async def received_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE
         end_date = start_date + timedelta(days=2)
         query_display = "Este fin de semana"
     else:
-        # Opción no válida, se termina la conversación.
         return ConversationHandler.END
 
     start_date_str = start_date.strftime('%Y-%m-%d')
@@ -352,7 +368,6 @@ async def received_custom_date(update: Update, context: ContextTypes.DEFAULT_TYP
     """
     date_text = update.message.text
     try:
-        # Validamos el formato de la fecha
         datetime.strptime(date_text, '%Y-%m-%d')
         start_date_str = end_date_str = date_text
         
@@ -399,7 +414,6 @@ async def alertas_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Si viene de un comando, responde. Si viene de un botón, edita.
     if update.message:
         await update.message.reply_text("Gestiona tus alertas:", reply_markup=reply_markup)
     else:
@@ -490,7 +504,6 @@ async def delete_alert_callback(update: Update, context: ContextTypes.DEFAULT_TY
     delete_alert(alert_id)
     await query.answer(text="Alerta borrada.", show_alert=True)
     
-    # Refrescamos la vista de alertas
     return await view_alerts(update, context)
 
 
@@ -522,23 +535,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         message, reply_markup = await format_events_message(events, total_events, offset)
         
     elif data.startswith("search_"):
-        parts = data.split('_')
-        search_type = parts[1]
+        # --- INICIO DE LA CORRECCIÓN ---
+        # La lógica de parsing anterior era frágil y causaba errores con 'event_name'.
+        # Esta nueva lógica es más robusta y explícita.
+        try:
+            # 1. Separamos la parte principal del offset, que siempre es el último número
+            main_part, offset_str = data.rsplit('_', 1)
+            offset = int(offset_str)
+        except (ValueError, IndexError):
+            logger.error(f"Error al parsear el callback_data de paginación: {data}")
+            return
+
+        # 2. Eliminamos el prefijo 'search_' para quedarnos con 'type_query'
+        search_part = main_part[len("search_"):]
         
+        # 3. Identificamos el tipo de búsqueda y extraemos la query
+        search_type = ""
+        query_text = ""
+        start_date_str = ""
+        end_date_str = ""
+
+        if search_part.startswith("date_"):
+            search_type = "date"
+            date_query = search_part[len("date_"):]
+            start_date_str, end_date_str = date_query.split('_')
+        elif search_part.startswith("event_name_"):
+            search_type = "event_name"
+            query_text = search_part[len("event_name_"):]
+        elif search_part.startswith("artist_"):
+            search_type = "artist"
+            query_text = search_part[len("artist_"):]
+        elif search_part.startswith("club_"):
+            search_type = "club"
+            query_text = search_part[len("club_"):]
+        
+        if not search_type:
+            logger.error(f"Tipo de búsqueda desconocido en callback_data: {data}")
+            return
+        # --- FIN DE LA CORRECCIÓN ---
+
+        # 4. Usamos las variables parseadas para obtener los datos
         if search_type == "date":
-            start_date_str, end_date_str, offset = parts[2], parts[3], int(parts[4])
             events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=offset)
             query_display = f"del {start_date_str} al {end_date_str}" if start_date_str != end_date_str else start_date_str
             search_info = {'type': 'date', 'query': f"{start_date_str}_{end_date_str}", 'query_display': query_display}
             message, reply_markup = await format_events_message(events, total, offset, search_info)
         else:
-            # Reconstruimos la query por si contenía guiones bajos
-            query_text = "_".join(parts[2:-1])
-            offset = int(parts[-1])
-            search_by_db = 'artists' if search_type == 'artist' else 'club_name'
-            events, total = search_events(query=query_text, search_by=search_by_db, limit=EVENTS_PER_PAGE, offset=offset)
-            search_info = {'type': search_type, 'query': query_text, 'query_display': query_text}
-            message, reply_markup = await format_events_message(events, total, offset, search_info)
+            column_map = {
+                'artist': 'artists',
+                'club': 'club_name',
+                'event_name': 'event_name'
+            }
+            search_by_db = column_map.get(search_type)
+            
+            if search_by_db:
+                events, total = search_events(query=query_text, search_by=search_by_db, limit=EVENTS_PER_PAGE, offset=offset)
+                search_info = {'type': search_type, 'query': query_text, 'query_display': query_text}
+                message, reply_markup = await format_events_message(events, total, offset, search_info)
 
     if message:
         await query.edit_message_text(
@@ -555,18 +608,12 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Tarea periódica que busca nuevos eventos y notifica a los usuarios con alertas.
     """
-    # Esta función debería idealmente usar las funciones del módulo 'database'
-    # para mantener la lógica de la BD centralizada.
-    # Por ahora, se mantiene la conexión directa para respetar el código original.
-    from database import get_unnotified_events, mark_event_as_notified
-
     new_events = get_unnotified_events()
     
     if new_events:
         logger.info(f"Notificador: Se encontraron {len(new_events)} nuevos eventos para procesar.")
 
     for event in new_events:
-        # La función find_users_for_new_event ya devuelve un dict del evento
         users_to_notify = find_users_for_new_event(event)
         
         if users_to_notify:
@@ -578,7 +625,7 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"*{escape_markdown_v2(event['event_name'])}*\n\n"
                 f"📍 *Club:* {escape_markdown_v2(event['club_name'])}\n"
                 f"📅 *Fecha:* {escape_markdown_v2(formatted_date)}\n"
-                f"🎵 *Artistas:* {escape_markdown_v2(event['artists'])}\n\n"
+                f"� *Artistas:* {escape_markdown_v2(event['artists'])}\n\n"
                 f"🎟️ [Ver Evento]({event['source_link']})"
             )
             
@@ -601,7 +648,6 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception as e:
                     logger.error(f"Error al notificar al usuario {chat_id} por evento {event['id']}: {e}")
         
-        # Marcamos el evento como notificado
         mark_event_as_notified(event['id'])
 
 
@@ -616,7 +662,6 @@ def main() -> None:
 
     # Configuración de la tarea periódica (Job Queue)
     job_queue = application.job_queue
-    # Se ejecuta cada 5 minutos (300s), empezando 15s después de iniciar el bot.
     job_queue.run_repeating(check_and_notify, interval=300, first=15)
 
     # --- Handlers de Conversación ---
@@ -624,7 +669,7 @@ def main() -> None:
         entry_points=[CommandHandler("buscar", buscar_start)],
         states={
             CHOOSING_SEARCH: [
-                CallbackQueryHandler(ask_for_search_term, pattern="^search_by_(artist|club)$"),
+                CallbackQueryHandler(ask_for_search_term, pattern="^search_by_(artist|club|event_name)$"),
                 CallbackQueryHandler(ask_for_date_range, pattern="^search_by_date$")
             ],
             TYPING_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_search_query)],
@@ -662,7 +707,6 @@ def main() -> None:
     application.add_handler(search_conv_handler)
     application.add_handler(alert_conv_handler)
     
-    # Este handler debe ir después de las conversaciones para no interferir.
     application.add_handler(CallbackQueryHandler(button_handler, pattern="^(page_|search_)"))
 
     logger.info("Bot iniciado y escuchando...")

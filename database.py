@@ -124,7 +124,7 @@ def search_events(query: str, search_by: str, limit: int = 5, offset: int = 0) -
         Tuple[List[Dict[str, Any]], int]: Tupla con la lista de eventos encontrados y el total.
     """
     # Whitelist para evitar inyección SQL en el nombre de la columna. ¡Muy importante!
-    if search_by not in ['artists', 'club_name']:
+    if search_by not in ['artists', 'club_name', 'event_name']:
         return [], 0
 
     search_term = f'%{query}%'
