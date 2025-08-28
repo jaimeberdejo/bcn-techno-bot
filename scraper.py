@@ -16,12 +16,15 @@ QUERY_TEMPLATE_PATH = "graphql_query_template.json"
 AREA_ID_BARCELONA = 20
 
 def fetch_events_from_api(start_date_str, end_date_str):
+    """Obtiene los eventos de la API de RA en un rango de fechas."""
     print(f"-> Obteniendo todos los eventos desde {start_date_str} hasta {end_date_str}...")
     with open(QUERY_TEMPLATE_PATH, "r") as file:
         payload_template = json.load(file)
+    
     payload_template["variables"]["filters"]["areas"]["eq"] = AREA_ID_BARCELONA
     payload_template["variables"]["filters"]["listingDate"]["gte"] = start_date_str
     payload_template["variables"]["filters"]["listingDate"]["lte"] = end_date_str
+    
     all_events_in_range = []
     page_number = 1
     while True:
@@ -34,27 +37,34 @@ def fetch_events_from_api(start_date_str, end_date_str):
             if 'errors' in data:
                 print(f"  -> Error de la API: {data['errors']}")
                 break
+            
             events_page = data.get("data", {}).get("eventListings", {}).get("data", [])
             if not events_page:
                 print("  -> No se encontraron más eventos. Terminando paginación.")
                 break
+            
             print(f"  -> Se encontraron {len(events_page)} eventos en la página {page_number}.")
             all_events_in_range.extend(events_page)
             page_number += 1
-            time.sleep(1)
-        except Exception as e:
-            print(f"  -> Error en la petición: {e}")
+            time.sleep(1) # Pausa para no saturar la API
+        except requests.RequestException as e:
+            print(f"  -> Error en la petición a la API: {e}")
             break
+        except Exception as e:
+            print(f"  -> Error inesperado: {e}")
+            break
+            
     return all_events_in_range
 
 def transform_and_save_events(events):
     """
     Transforma los datos de la API al formato de nuestra BD y los guarda.
-    Versión mejorada para manejar eventos sin imagen de flyer.
+    Implementa una lógica de "upsert": inserta nuevos eventos y actualiza los existentes.
     """
     conn = sqlite3.connect('techno_events.db')
     cursor = conn.cursor()
     new_events_count = 0
+    updated_events_count = 0
     processed_count = 0
 
     for item in events:
@@ -70,16 +80,23 @@ def transform_and_save_events(events):
 
             artists_list = [artist['name'] for artist in event.get('artists', []) if artist.get('name')]
             
-            # --- CÓDIGO CORREGIDO PARA LAS IMÁGENES ---
-            images_list = event.get('images', []) # Obtenemos la lista de imágenes
-            flyer_image = "" # Por defecto, no hay imagen
-            if images_list: # Solo si la lista NO está vacía...
+            images_list = event.get('images', [])
+            flyer_image = ""
+            if images_list:
                 flyer_filename = images_list[0].get('filename', '')
                 if flyer_filename:
                     flyer_image = "https://images.ra.co/" + flyer_filename
-            # -----------------------------------------
+            
+            source_link = "https://ra.co" + event.get('contentUrl', '')
 
-            event_data = {
+            # --- INICIO DE LA LÓGICA DE ACTUALIZACIÓN ---
+            
+            # 1. Comprobar si el evento ya existe usando el enlace único
+            cursor.execute("SELECT id FROM events WHERE source_link = ?", (source_link,))
+            existing_event = cursor.fetchone()
+
+            # Datos que se pueden actualizar
+            update_data = {
                 "event_name": event.get('title'),
                 "club_name": event.get('venue', {}).get('name', 'TBA'),
                 "event_date": date_obj.strftime('%Y-%m-%d'),
@@ -87,21 +104,46 @@ def transform_and_save_events(events):
                 "end_time": end_time_obj.strftime('%H:%M'),
                 "artists": ", ".join(artists_list) or "Artistas por confirmar",
                 "attending_count": event.get('attending', 0),
-                "buy_link": "https://ra.co" + event.get('contentUrl', ''),
-                "source_link": "https://ra.co" + event.get('contentUrl', ''),
+                "buy_link": source_link, # Usamos el mismo que source_link
                 "flyer_image": flyer_image,
+                "source_link": source_link # Para la cláusula WHERE
             }
 
-            cursor.execute('''
-                INSERT OR IGNORE INTO events 
-                (event_name, club_name, event_date, start_time, end_time, artists, attending_count, buy_link, source_link, flyer_image)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', tuple(event_data.values()))
-            
-            if cursor.rowcount > 0:
-                new_events_count += 1
+            if existing_event:
+                # 2. Si existe, ACTUALIZAR los datos que pueden cambiar
+                update_query = """
+                    UPDATE events SET
+                        event_name = :event_name,
+                        club_name = :club_name,
+                        event_date = :event_date,
+                        start_time = :start_time,
+                        end_time = :end_time,
+                        artists = :artists,
+                        attending_count = :attending_count,
+                        buy_link = :buy_link,
+                        flyer_image = :flyer_image
+                    WHERE source_link = :source_link
+                """
+                cursor.execute(update_query, update_data)
+                if cursor.rowcount > 0:
+                    updated_events_count += 1
+            else:
+                # 3. Si no existe, INSERTAR el nuevo evento
+                insert_query = """
+                    INSERT INTO events 
+                    (event_name, club_name, event_date, start_time, end_time, artists, attending_count, buy_link, source_link, flyer_image)
+                    VALUES (:event_name, :club_name, :event_date, :start_time, :end_time, :artists, :attending_count, :buy_link, :source_link, :flyer_image)
+                """
+                # Quitamos el último item (:source_link) que no es parte de los valores a insertar
+                insert_data = {k: v for k, v in update_data.items() if k != 'source_link'}
+                insert_data['source_link'] = source_link # Lo añadimos de nuevo
+                cursor.execute(insert_query, insert_data)
+
+                if cursor.rowcount > 0:
+                    new_events_count += 1
+            # --- FIN DE LA LÓGICA DE ACTUALIZACIÓN ---
+
         except Exception as e:
-            # Mantenemos esto por si surge un error diferente
             print(f"  -> Advertencia: No se pudo procesar el evento '{event.get('title')}'. Razón: {e}")
             continue
 
@@ -109,10 +151,11 @@ def transform_and_save_events(events):
     conn.close()
     
     print(f"\n-> Se procesaron {processed_count} eventos en total.")
-    return new_events_count
-
-
+    print(f"-> Eventos nuevos añadidos: {new_events_count}")
+    print(f"-> Eventos existentes actualizados: {updated_events_count}")
     
+    return new_events_count # Devolvemos solo los nuevos para el log del bot
+
 # El bloque __main__ no necesita cambios
 if __name__ == '__main__':
     print("--- Iniciando Scraper (API GraphQL - Todos los Eventos Futuros) ---")
@@ -123,6 +166,5 @@ if __name__ == '__main__':
     api_events = fetch_events_from_api(start_date_str, end_date_str)
     if api_events:
         print(f"\nSe encontraron un total de {len(api_events)} eventos en el rango de fechas a través de la API.")
-        newly_added = transform_and_save_events(api_events)
-        print(f"\nTotal de eventos nuevos añadidos a la base de datos: {newly_added}")
+        transform_and_save_events(api_events)
     print("\n--- Proceso de Scraping Finalizado ---")

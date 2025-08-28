@@ -18,7 +18,9 @@ Funcionalidades principales:
 # --- IMPORTACIONES ---
 import logging
 import re
+import os
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
 # Importaciones de la librería python-telegram-bot
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -47,7 +49,14 @@ from database import (
     mark_event_as_notified,
 )
 
+# Importaciones del scraper para integrarlo en el bot
+from scraper import fetch_events_from_api, transform_and_save_events
+
+
 # --- CONFIGURACIÓN Y CONSTANTES ---
+
+# Cargar variables de entorno desde el archivo .env
+load_dotenv()
 
 # Configuración del logging para monitorizar el bot
 logging.basicConfig(
@@ -56,8 +65,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constantes del Bot
-BOT_TOKEN = "8204992864:AAGDjAaZ7TNDt8C50YAmgExH0qDrW_zaKw8"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.error("No se encontró el BOT_TOKEN en las variables de entorno.")
+    exit()
+
 EVENTS_PER_PAGE = 5  # Número de eventos a mostrar por página
 
 # --- ESTADOS DE CONVERSACIÓN ---
@@ -535,21 +547,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         message, reply_markup = await format_events_message(events, total_events, offset)
         
     elif data.startswith("search_"):
-        # --- INICIO DE LA CORRECCIÓN ---
-        # La lógica de parsing anterior era frágil y causaba errores con 'event_name'.
-        # Esta nueva lógica es más robusta y explícita.
         try:
-            # 1. Separamos la parte principal del offset, que siempre es el último número
             main_part, offset_str = data.rsplit('_', 1)
             offset = int(offset_str)
         except (ValueError, IndexError):
             logger.error(f"Error al parsear el callback_data de paginación: {data}")
             return
 
-        # 2. Eliminamos el prefijo 'search_' para quedarnos con 'type_query'
         search_part = main_part[len("search_"):]
         
-        # 3. Identificamos el tipo de búsqueda y extraemos la query
         search_type = ""
         query_text = ""
         start_date_str = ""
@@ -572,9 +578,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not search_type:
             logger.error(f"Tipo de búsqueda desconocido en callback_data: {data}")
             return
-        # --- FIN DE LA CORRECCIÓN ---
 
-        # 4. Usamos las variables parseadas para obtener los datos
         if search_type == "date":
             events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=offset)
             query_display = f"del {start_date_str} al {end_date_str}" if start_date_str != end_date_str else start_date_str
@@ -602,11 +606,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-# --- NOTIFICADOR AUTOMÁTICO (JOB QUEUE) ---
+# --- TAREAS PROGRAMADAS (JOB QUEUE) ---
 
 async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Tarea periódica que busca nuevos eventos y notifica a los usuarios con alertas.
+    Tarea periódica (cada 5 min) que busca nuevos eventos y notifica a los usuarios con alertas.
     """
     new_events = get_unnotified_events()
     
@@ -625,7 +629,7 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"*{escape_markdown_v2(event['event_name'])}*\n\n"
                 f"📍 *Club:* {escape_markdown_v2(event['club_name'])}\n"
                 f"📅 *Fecha:* {escape_markdown_v2(formatted_date)}\n"
-                f"� *Artistas:* {escape_markdown_v2(event['artists'])}\n\n"
+                f"🎵 *Artistas:* {escape_markdown_v2(event['artists'])}\n\n"
                 f"🎟️ [Ver Evento]({event['source_link']})"
             )
             
@@ -650,6 +654,23 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
         
         mark_event_as_notified(event['id'])
 
+async def run_scraping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Tarea periódica (cada 2 horas) para ejecutar el scraper y actualizar la base de datos.
+    """
+    logger.info("Iniciando tarea de scraping programada...")
+    try:
+        start_date = datetime.now()
+        end_date = start_date + timedelta(days=365)
+        api_events = fetch_events_from_api(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+        if api_events:
+            newly_added = transform_and_save_events(api_events)
+            logger.info(f"Scraping finalizado. {newly_added} eventos nuevos añadidos.")
+        else:
+            logger.info("Scraping finalizado. No se encontraron eventos en la API.")
+    except Exception as e:
+        logger.error(f"Error durante la ejecución del job de scraping: {e}")
+
 
 # --- FUNCIÓN PRINCIPAL ---
 
@@ -660,9 +681,13 @@ def main() -> None:
     logger.info("Iniciando bot...")
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Configuración de la tarea periódica (Job Queue)
+    # --- (INTEGRACIÓN) ---
+    # Configuración de las tareas periódicas (Job Queue)
     job_queue = application.job_queue
+    # Tarea 1: Notificar a usuarios sobre nuevos eventos cada 5 minutos.
     job_queue.run_repeating(check_and_notify, interval=300, first=15)
+    # Tarea 2: Actualizar la base de datos con nuevos eventos cada 2 horas.
+    job_queue.run_repeating(run_scraping_job, interval=7200, first=10)
 
     # --- Handlers de Conversación ---
     search_conv_handler = ConversationHandler(
