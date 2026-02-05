@@ -16,9 +16,11 @@ Funcionalidades principales:
 """
 
 # --- IMPORTACIONES ---
+import asyncio
 import logging
 import re
 import os
+import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -37,6 +39,7 @@ from telegram.ext import (
 
 # Importaciones locales de la base de datos
 from database import (
+    setup_database,
     get_upcoming_events,
     search_events,
     search_events_by_date,
@@ -68,7 +71,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     logger.error("No se encontró el BOT_TOKEN en las variables de entorno.")
-    exit()
+    sys.exit(1)
 
 EVENTS_PER_PAGE = 5  # Número de eventos a mostrar por página
 
@@ -112,7 +115,7 @@ async def format_events_message(events: list, total_events: int, offset: int, se
         events (list): La lista de eventos a formatear.
         total_events (int): El número total de eventos encontrados.
         offset (int): El desplazamiento actual para la paginación.
-        search_info (dict, optional): Información sobre la búsqueda actual.
+        search_info (dict, optional): Información sobre la búsqueda actual (clave 'query_display').
 
     Returns:
         tuple: Una tupla con el mensaje formateado (str) y el teclado inline (InlineKeyboardMarkup).
@@ -138,7 +141,7 @@ async def format_events_message(events: list, total_events: int, offset: int, se
     for event in events:
         date_obj = datetime.strptime(event['event_date'], '%Y-%m-%d')
         formatted_date = date_obj.strftime("%a, %d de %b").replace('.', '')
-        
+
         # Escapamos todos los campos para seguridad
         safe_name, safe_club, safe_date, safe_start, safe_end, safe_artists, safe_attending = map(
             escape_markdown_v2,
@@ -157,10 +160,10 @@ async def format_events_message(events: list, total_events: int, offset: int, se
             f"🎟️ [Más Info]({event['source_link']})\n\n"
         )
 
-    # Teclado de paginación
+    # Teclado de paginación con callbacks cortos (evita el límite de 64 bytes)
     keyboard = []
     row = []
-    base_callback = f"search_{search_info['type']}_{search_info['query']}" if search_info else "page"
+    base_callback = "sp" if search_info else "p"
 
     if offset > 0:
         row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"{base_callback}_{max(0, offset - EVENTS_PER_PAGE)}"))
@@ -215,14 +218,18 @@ async def proximas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Maneja el comando /proximas. Muestra la primera página de eventos futuros.
     """
-    events, total_events = get_upcoming_events(limit=EVENTS_PER_PAGE, offset=0)
-    message, reply_markup = await format_events_message(events, total_events, 0)
-    await update.message.reply_text(
-        message,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN_V2,
-        disable_web_page_preview=True
-    )
+    try:
+        events, total_events = get_upcoming_events(limit=EVENTS_PER_PAGE, offset=0)
+        message, reply_markup = await format_events_message(events, total_events, 0)
+        await update.message.reply_text(
+            message,
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logger.error(f"Error en /proximas: {e}")
+        await update.message.reply_text("Ha ocurrido un error al obtener los eventos. Inténtalo de nuevo.")
 
 
 # --- CONVERSACIÓN DE BÚSQUEDA (/buscar) ---
@@ -254,17 +261,17 @@ async def ask_for_search_term(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     query = update.callback_query
     await query.answer()
-    
+
     search_type = query.data.split('_by_')[-1]
     context.user_data['search_type'] = search_type
-    
+
     type_map = {
         'artist': 'del artista',
         'club': 'del club',
         'event_name': 'de la fiesta'
     }
     display_type = type_map.get(search_type, 'elemento')
-    
+
     await query.edit_message_text(text=f"Ok, dime el nombre {display_type} que buscas:")
     return TYPING_SEARCH
 
@@ -275,17 +282,25 @@ async def received_search_query(update: Update, context: ContextTypes.DEFAULT_TY
     """
     query_text = update.message.text
     search_type = context.user_data.get('search_type', 'artist')
-    
+
     column_map = {
         'artist': 'artists',
         'club': 'club_name',
         'event_name': 'event_name'
     }
     search_by_db = column_map.get(search_type, 'artists')
-    
+
     events, total = search_events(query=query_text, search_by=search_by_db, limit=EVENTS_PER_PAGE, offset=0)
-    search_info = {'type': search_type, 'query': query_text, 'query_display': query_text}
-    
+
+    # Guardar contexto de búsqueda para la paginación
+    context.user_data['search_context'] = {
+        'type': search_type,
+        'query': query_text,
+        'query_display': query_text,
+        'search_by_db': search_by_db,
+    }
+    search_info = {'query_display': query_text}
+
     message, markup = await format_events_message(events, total, 0, search_info)
     await update.message.reply_text(
         message,
@@ -293,8 +308,9 @@ async def received_search_query(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode=ParseMode.MARKDOWN_V2,
         disable_web_page_preview=True
     )
-    
-    context.user_data.clear()
+
+    # Limpiar solo datos de la conversación, no el contexto de búsqueda
+    context.user_data.pop('search_type', None)
     return ConversationHandler.END
 
 
@@ -304,7 +320,7 @@ async def ask_for_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """
     query = update.callback_query
     await query.answer()
-    
+
     keyboard = [
         [
             InlineKeyboardButton("Hoy", callback_data="date_range_today"),
@@ -326,18 +342,23 @@ async def received_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     query = update.callback_query
     await query.answer()
-    
+
     choice = query.data.split('_')[-1]
     today = datetime.now()
-    
+
     if choice == "today":
         start_date, end_date, query_display = today, today, "Hoy"
     elif choice == "tomorrow":
         start_date = end_date = today + timedelta(days=1)
         query_display = "Mañana"
     elif choice == "weekend":
-        days_until_friday = (4 - today.weekday() + 7) % 7
-        start_date = today + timedelta(days=days_until_friday)
+        weekday = today.weekday()
+        if weekday <= 4:  # Lunes a viernes: próximo fin de semana
+            days_until_friday = (4 - weekday) % 7
+            start_date = today + timedelta(days=days_until_friday)
+        else:  # Sábado (5) o domingo (6): fin de semana actual
+            days_since_friday = weekday - 4
+            start_date = today - timedelta(days=days_since_friday)
         end_date = start_date + timedelta(days=2)
         query_display = "Este fin de semana"
     else:
@@ -345,10 +366,18 @@ async def received_date_range(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     start_date_str = start_date.strftime('%Y-%m-%d')
     end_date_str = end_date.strftime('%Y-%m-%d')
-    
+
     events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=0)
-    search_info = {'type': 'date', 'query': f"{start_date_str}_{end_date_str}", 'query_display': query_display}
-    
+
+    # Guardar contexto de búsqueda para la paginación
+    context.user_data['search_context'] = {
+        'type': 'date',
+        'start_date': start_date_str,
+        'end_date': end_date_str,
+        'query_display': query_display,
+    }
+    search_info = {'query_display': query_display}
+
     message, markup = await format_events_message(events, total, 0, search_info)
     await query.edit_message_text(
         text=message,
@@ -365,7 +394,7 @@ async def ask_for_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     query = update.callback_query
     await query.answer()
-    
+
     await query.edit_message_text(
         "Ok, dime la fecha que buscas en formato `AAAA-MM-DD`\n"
         "Por ejemplo: `2025-09-27`",
@@ -382,10 +411,18 @@ async def received_custom_date(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         datetime.strptime(date_text, '%Y-%m-%d')
         start_date_str = end_date_str = date_text
-        
+
         events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=0)
-        search_info = {'type': 'date', 'query': f"{start_date_str}_{end_date_str}", 'query_display': start_date_str}
-        
+
+        # Guardar contexto de búsqueda para la paginación
+        context.user_data['search_context'] = {
+            'type': 'date',
+            'start_date': start_date_str,
+            'end_date': end_date_str,
+            'query_display': start_date_str,
+        }
+        search_info = {'query_display': start_date_str}
+
         message, markup = await format_events_message(events, total, 0, search_info)
         await update.message.reply_text(
             message,
@@ -425,14 +462,14 @@ async def alertas_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         [InlineKeyboardButton("✖️ Salir", callback_data="cancel_alert_menu")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     if update.message:
         await update.message.reply_text("Gestiona tus alertas:", reply_markup=reply_markup)
     else:
         query = update.callback_query
         await query.answer()
         await query.edit_message_text("Gestiona tus alertas:", reply_markup=reply_markup)
-        
+
     return ALERT_MENU
 
 
@@ -462,7 +499,7 @@ async def received_artist_alert(update: Update, context: ContextTypes.DEFAULT_TY
     """
     artist_name = update.message.text
     add_alert(update.message.chat_id, 'artist', artist_name)
-    await update.message.reply_text(f"¡Hecho! Te avisaré cuando haya un evento de '{escape_markdown_v2(artist_name)}'\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(f"¡Hecho! Te avisaré cuando haya un evento de '{artist_name}'.", parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -472,7 +509,7 @@ async def received_club_alert(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     club_name = update.message.text
     add_alert(update.message.chat_id, 'club', club_name)
-    await update.message.reply_text(f"¡Hecho! Te avisaré cuando haya un evento en '{escape_markdown_v2(club_name)}'\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(f"¡Hecho! Te avisaré cuando haya un evento en '{club_name}'.", parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -482,9 +519,10 @@ async def view_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     """
     query = update.callback_query
     await query.answer()
-    
-    alerts = get_user_alerts(query.from_user.id)
-    
+
+    chat_id = query.message.chat.id
+    alerts = get_user_alerts(chat_id)
+
     if not alerts:
         keyboard = [[InlineKeyboardButton("⬅️ Volver", callback_data="back_to_alert_menu")]]
         await query.edit_message_text(
@@ -500,7 +538,7 @@ async def view_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         value_capitalized = alert['alert_value'].title()
         message += f"{icon} {value_capitalized}\n"
         keyboard.append([InlineKeyboardButton(f"🗑️ Borrar '{value_capitalized}'", callback_data=f"delete_alert_{alert['id']}")])
-    
+
     keyboard.append([InlineKeyboardButton("⬅️ Volver al Menú", callback_data="back_to_alert_menu")])
     await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
     return ALERT_MENU
@@ -512,10 +550,11 @@ async def delete_alert_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """
     query = update.callback_query
     alert_id = int(query.data.split('_')[-1])
-    
-    delete_alert(alert_id)
+    chat_id = query.message.chat.id
+
+    delete_alert(alert_id, chat_id)
     await query.answer(text="Alerta borrada.", show_alert=True)
-    
+
     return await view_alerts(update, context)
 
 
@@ -534,76 +573,55 @@ async def end_alert_conversation(update: Update, context: ContextTypes.DEFAULT_T
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Maneja los botones de paginación para los resultados de eventos.
+    Los callbacks usan IDs cortos ('p_N' para próximas, 'sp_N' para búsqueda)
+    y el contexto de búsqueda se almacena en context.user_data['search_context'].
     """
     query = update.callback_query
     await query.answer()
-    
+
     data = query.data
     message, reply_markup = "", None
 
-    if data.startswith("page_"):
-        offset = int(data.split("_")[1])
-        events, total_events = get_upcoming_events(limit=EVENTS_PER_PAGE, offset=offset)
-        message, reply_markup = await format_events_message(events, total_events, offset)
-        
-    elif data.startswith("search_"):
-        try:
-            main_part, offset_str = data.rsplit('_', 1)
-            offset = int(offset_str)
-        except (ValueError, IndexError):
-            logger.error(f"Error al parsear el callback_data de paginación: {data}")
-            return
+    try:
+        if data.startswith("p_"):
+            offset = int(data.split("_")[1])
+            events, total_events = get_upcoming_events(limit=EVENTS_PER_PAGE, offset=offset)
+            message, reply_markup = await format_events_message(events, total_events, offset)
 
-        search_part = main_part[len("search_"):]
-        
-        search_type = ""
-        query_text = ""
-        start_date_str = ""
-        end_date_str = ""
+        elif data.startswith("sp_"):
+            offset = int(data.split("_")[1])
+            sc = context.user_data.get('search_context')
 
-        if search_part.startswith("date_"):
-            search_type = "date"
-            date_query = search_part[len("date_"):]
-            start_date_str, end_date_str = date_query.split('_')
-        elif search_part.startswith("event_name_"):
-            search_type = "event_name"
-            query_text = search_part[len("event_name_"):]
-        elif search_part.startswith("artist_"):
-            search_type = "artist"
-            query_text = search_part[len("artist_"):]
-        elif search_part.startswith("club_"):
-            search_type = "club"
-            query_text = search_part[len("club_"):]
-        
-        if not search_type:
-            logger.error(f"Tipo de búsqueda desconocido en callback_data: {data}")
-            return
+            if not sc:
+                await query.edit_message_text(
+                    "La búsqueda ha expirado\\. Usa /buscar para iniciar una nueva\\.",
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+                return
 
-        if search_type == "date":
-            events, total = search_events_by_date(start_date_str, end_date_str, limit=EVENTS_PER_PAGE, offset=offset)
-            query_display = f"del {start_date_str} al {end_date_str}" if start_date_str != end_date_str else start_date_str
-            search_info = {'type': 'date', 'query': f"{start_date_str}_{end_date_str}", 'query_display': query_display}
+            if sc['type'] == 'date':
+                events, total = search_events_by_date(
+                    sc['start_date'], sc['end_date'],
+                    limit=EVENTS_PER_PAGE, offset=offset
+                )
+            else:
+                events, total = search_events(
+                    query=sc['query'], search_by=sc['search_by_db'],
+                    limit=EVENTS_PER_PAGE, offset=offset
+                )
+
+            search_info = {'query_display': sc['query_display']}
             message, reply_markup = await format_events_message(events, total, offset, search_info)
-        else:
-            column_map = {
-                'artist': 'artists',
-                'club': 'club_name',
-                'event_name': 'event_name'
-            }
-            search_by_db = column_map.get(search_type)
-            
-            if search_by_db:
-                events, total = search_events(query=query_text, search_by=search_by_db, limit=EVENTS_PER_PAGE, offset=offset)
-                search_info = {'type': search_type, 'query': query_text, 'query_display': query_text}
-                message, reply_markup = await format_events_message(events, total, offset, search_info)
 
-    if message:
-        await query.edit_message_text(
-            text=message,
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN_V2,
-            disable_web_page_preview=True
-        )
+        if message:
+            await query.edit_message_text(
+                text=message,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        logger.error(f"Error en el handler de paginación: {e}")
 
 
 # --- TAREAS PROGRAMADAS (JOB QUEUE) ---
@@ -613,17 +631,17 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
     Tarea periódica (cada 5 min) que busca nuevos eventos y notifica a los usuarios con alertas.
     """
     new_events = get_unnotified_events()
-    
+
     if new_events:
         logger.info(f"Notificador: Se encontraron {len(new_events)} nuevos eventos para procesar.")
 
     for event in new_events:
         users_to_notify = find_users_for_new_event(event)
-        
+
         if users_to_notify:
             date_obj = datetime.strptime(event['event_date'], '%Y-%m-%d')
             formatted_date = date_obj.strftime("%a, %d de %b").replace('.', '')
-            
+
             message = (
                 f"🔥 *¡ALERTA DE NUEVA FIESTA\\!*\n\n"
                 f"*{escape_markdown_v2(event['event_name'])}*\n\n"
@@ -632,7 +650,7 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"🎵 *Artistas:* {escape_markdown_v2(event['artists'])}\n\n"
                 f"🎟️ [Ver Evento]({event['source_link']})"
             )
-            
+
             for chat_id in users_to_notify:
                 try:
                     if event['flyer_image']:
@@ -651,7 +669,7 @@ async def check_and_notify(context: ContextTypes.DEFAULT_TYPE) -> None:
                         )
                 except Exception as e:
                     logger.error(f"Error al notificar al usuario {chat_id} por evento {event['id']}: {e}")
-        
+
         mark_event_as_notified(event['id'])
 
 async def run_scraping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -662,9 +680,11 @@ async def run_scraping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         start_date = datetime.now()
         end_date = start_date + timedelta(days=365)
-        api_events = fetch_events_from_api(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+        api_events = await asyncio.to_thread(
+            fetch_events_from_api, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+        )
         if api_events:
-            newly_added = transform_and_save_events(api_events)
+            newly_added = await asyncio.to_thread(transform_and_save_events, api_events)
             logger.info(f"Scraping finalizado. {newly_added} eventos nuevos añadidos.")
         else:
             logger.info("Scraping finalizado. No se encontraron eventos en la API.")
@@ -678,6 +698,9 @@ def main() -> None:
     """
     Función principal que configura y ejecuta el bot.
     """
+    # Inicializar la base de datos antes de arrancar
+    setup_database()
+
     logger.info("Iniciando bot...")
     application = Application.builder().token(BOT_TOKEN).build()
 
@@ -728,11 +751,11 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("proximas", proximas))
-    
+
     application.add_handler(search_conv_handler)
     application.add_handler(alert_conv_handler)
-    
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(page_|search_)"))
+
+    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(p_|sp_)"))
 
     logger.info("Bot iniciado y escuchando...")
     application.run_polling()

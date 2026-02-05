@@ -15,7 +15,7 @@ from typing import List, Tuple, Dict, Any
 
 DB_NAME = 'techno_events.db'
 
-def _get_db_connection() -> sqlite3.Connection:
+def get_db_connection() -> sqlite3.Connection:
     """
     Establece y devuelve una conexión a la base de datos.
     Configura row_factory para que las filas se puedan acceder como diccionarios.
@@ -35,7 +35,7 @@ def setup_database() -> None:
     Esta función se ejecuta una vez para inicializar el esquema de la BD.
     """
     print("Configurando la base de datos...")
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
 
         # Tabla de eventos
@@ -91,7 +91,7 @@ def get_upcoming_events(limit: int = 5, offset: int = 0) -> Tuple[List[Dict[str,
     Returns:
         Tuple[List[Dict[str, Any]], int]: Una tupla con la lista de eventos y el número total de eventos futuros.
     """
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         
         # Obtener eventos paginados
@@ -129,7 +129,7 @@ def search_events(query: str, search_by: str, limit: int = 5, offset: int = 0) -
 
     search_term = f'%{query}%'
     
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         
         # Contar total de resultados
@@ -164,7 +164,7 @@ def search_events_by_date(start_date: str, end_date: str, limit: int = 5, offset
     Returns:
         Tuple[List[Dict[str, Any]], int]: Tupla con la lista de eventos encontrados y el total.
     """
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         
         # Contar total de resultados
@@ -190,7 +190,7 @@ def get_unnotified_events() -> List[Dict[str, Any]]:
     Returns:
         List[Dict[str, Any]]: Lista de eventos no notificados.
     """
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM events WHERE notified = 0")
         events = [dict(row) for row in cursor.fetchall()]
@@ -203,7 +203,7 @@ def mark_event_as_notified(event_id: int) -> None:
     Args:
         event_id (int): El ID del evento a actualizar.
     """
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE events SET notified = 1 WHERE id = ?", (event_id,))
         conn.commit()
@@ -218,7 +218,7 @@ def add_user_if_not_exists(chat_id: int) -> None:
     Args:
         chat_id (int): El ID del chat del usuario de Telegram.
     """
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
         conn.commit()
@@ -234,7 +234,7 @@ def add_alert(chat_id: int, alert_type: str, alert_value: str) -> None:
     """
     # Aseguramos que el usuario exista antes de añadir una alerta
     add_user_if_not_exists(chat_id)
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         # Se guarda el valor en minúsculas para búsquedas insensibles a mayúsculas
         query = "INSERT OR IGNORE INTO alerts (chat_id, alert_type, alert_value) VALUES (?, ?, ?)"
@@ -251,22 +251,23 @@ def get_user_alerts(chat_id: int) -> List[Dict[str, Any]]:
     Returns:
         List[Dict[str, Any]]: Lista de las alertas del usuario.
     """
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, alert_type, alert_value FROM alerts WHERE chat_id = ?", (chat_id,))
         alerts = [dict(row) for row in cursor.fetchall()]
         return alerts
 
-def delete_alert(alert_id: int) -> None:
+def delete_alert(alert_id: int, chat_id: int) -> None:
     """
-    Elimina una alerta específica por su ID.
+    Elimina una alerta específica por su ID, verificando que pertenece al usuario.
 
     Args:
         alert_id (int): El ID de la alerta a eliminar.
+        chat_id (int): El ID del chat del usuario, para verificar propiedad.
     """
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+        cursor.execute("DELETE FROM alerts WHERE id = ? AND chat_id = ?", (alert_id, chat_id))
         conn.commit()
 
 def find_users_for_new_event(event: Dict[str, Any]) -> List[int]:
@@ -280,7 +281,7 @@ def find_users_for_new_event(event: Dict[str, Any]) -> List[int]:
         List[int]: Una lista de chat_ids únicos a notificar.
     """
     chat_ids_to_notify = set()
-    with _get_db_connection() as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
 
         # 1. Buscar por club
